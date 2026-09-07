@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+
+# Generated media and presentation artifacts
+*.mp3
+*.m4a
+*.wav
+*.mp4
+*.mov
+*.pptx
+*.pdf
+*.srt
+*.ass
+
+# Temporary render output
+tmp/
+temp/
+render*/
+exports/
