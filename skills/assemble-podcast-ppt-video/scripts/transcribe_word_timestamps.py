@@ -6,9 +6,6 @@ import math
 import os
 from pathlib import Path
 
-from faster_whisper import WhisperModel
-from faster_whisper.audio import decode_audio
-
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create resilient word timestamps with faster-whisper.")
@@ -28,6 +25,14 @@ def main() -> int:
     args = parser.parse_args()
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be at least 1")
+
+    thread_limit = str(args.cpu_threads)
+    os.environ["OMP_NUM_THREADS"] = thread_limit
+    os.environ["OPENBLAS_NUM_THREADS"] = thread_limit
+    os.environ["MKL_NUM_THREADS"] = thread_limit
+
+    from faster_whisper import WhisperModel
+    from faster_whisper.audio import decode_audio
 
     model = WhisperModel(
         args.model,

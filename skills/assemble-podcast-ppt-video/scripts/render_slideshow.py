@@ -49,7 +49,12 @@ def main() -> int:
         "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
         "-shortest", str(project / args.output),
     ])
-    subprocess.run(command, check=True, cwd=project)
+    process_env = os.environ.copy()
+    thread_limit = str(args.threads)
+    process_env["OMP_NUM_THREADS"] = thread_limit
+    process_env["OPENBLAS_NUM_THREADS"] = thread_limit
+    process_env["MKL_NUM_THREADS"] = thread_limit
+    subprocess.run(command, check=True, cwd=project, env=process_env)
     return 0
 
 
