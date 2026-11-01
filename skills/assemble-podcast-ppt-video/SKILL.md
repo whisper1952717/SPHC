@@ -89,6 +89,13 @@ Never cut by a fixed timestamp or silence alone.
 5. Cut at the verified first content phoneme, apply only a 5–10 ms click-safe
    fade, and re-transcribe the first 5–10 seconds.
 
+Check local active-audio/word coverage before alignment, including after an
+intro and at recognition-window boundaries. A high global match rate must not
+hide a missed paragraph. Re-transcribe a confirmed hole with a speech-only
+range; keep raw recognition and evidence. Do not interpolate an entire missing
+passage. Use one retained-interval map for all cuts, regenerate dependent timing,
+and independently check every join as well as the first and last content.
+
 If music overlaps the required first phoneme, use a dedicated cleanup pass.
 Never leave the music tail or remove the first syllable silently.
 
@@ -101,6 +108,9 @@ Never leave the music tail or remove the first syllable silently.
 - Record match coverage; interpolate only unmatched character timings.
 - Split on sentences or natural complete phrases. Never split a Chinese word to
   satisfy width.
+- Use full Simplified-Chinese conversion, not a small character replacement
+  table. Review all captions after lexical splitting; reviewed cue overrides
+  must preserve the canonical script's normalized full text.
 - Render one white line with dark outline/shadow inside safe margins. Prefer
   `Noto Sans SC` when no reference style overrides it.
 - Keep editable `.srt`, `.ass`, and timing JSON beside production artifacts.
@@ -112,6 +122,32 @@ Never leave the music tail or remove the first syllable silently.
 - Segment the aligned narration into semantic blocks before assigning pages.
   For each block, choose the strongest matching anchor from the entire deck;
   do not default to the next page number.
+- For every narration block, select a page whose prominent visible content can
+  be justified sentence by sentence from the concurrent narration. Record
+  `spoken meaning`, `visible claim`, `visible supporting details`, and `match
+  level` in the semantic map. Judge the title, main claim, examples, labels,
+  checklist items, actions, and conclusion that a viewer can actually see. A
+  shared chapter, keyword, or topic is not sufficient evidence.
+
+  | Match level | Test | Result |
+  |---|---|---|
+  | Exact | The visible claim, example, action, or conclusion is being spoken now | Pass |
+  | Direct summary | The page compresses the current narration without introducing new teaching content | Pass |
+  | Section-related | The page shares the topic but prominently shows specific content not currently spoken or directly supported | Fail |
+  | Unrelated or late | The page belongs elsewhere or appears after its meaning has passed | Fail |
+
+- Match narration and slide granularity. When the PPT expands a broad spoken
+  point into branches, examples, tools, diagnostics, or action steps that the
+  audio does not cover, keep or return to a broader overview page, reuse the
+  strongest valid page, or skip the detailed page. Never show a specific page
+  merely because it belongs to the same section or because it has not appeared
+  yet.
+- Treat these density mismatches as automatic warnings that require a different
+  page unless the concurrent narration directly supports every prominent item:
+  the audio gives one broad sentence while the page shows several branches;
+  the audio lists categories while the page drills into one category; the
+  audio explains `why` while the page introduces an unspoken `how`; or the
+  audio states a result while the page shows an unspoken case.
 - Treat the resulting narration-to-visual map as the source of truth. PPT order
   resolves ties only; it must never override a stronger semantic match.
 - A page may be skipped, reordered, revisited, or held across several narration
@@ -120,21 +156,40 @@ Never leave the music tail or remove the first syllable silently.
 - Start slides from aligned meaning, never equal duration or character ratios.
 - Keep the cover at least 6 seconds and ordinary slides at least 4.5 seconds,
   unless an approved faster pacing contract explicitly replaces these defaults.
+  These hold times are subordinate to semantic correctness: if inserting a
+  detailed page would make it appear late, remain after its narration has moved
+  on, or delay the next semantically correct page, skip it or assign the whole
+  narration block to a broader valid page. Never preserve a page by shifting
+  its boundary away from the spoken cue.
 - Show a formula, diagram, table, or semantic group before or exactly when its
   explanation begins, never afterward.
 - Dynamic: map every independently narrated direct-root group to its spoken cue;
   group order alone is not semantic timing.
 - Review for quick flashes, late evidence, and topic mismatch before rendering.
-- Before rendering, create semantic checkpoints at every visual change and at
-  regular points inside long holds. Each checkpoint records the concurrent
-  narration meaning, expected slide/group, and actual slide/group. Any mismatch
-  fails the timeline even when the page numbers are sequential.
+- Before rendering, audit from the first content sentence through the end, not
+  only user-reported timestamps, selected chapters, or suspected middle pages.
+  At every visual-state start, record the first and last concurrent subtitle or
+  meaning. For long holds, add regular internal checkpoints. Each checkpoint
+  records the concurrent narration meaning, expected slide/group, and actual
+  slide/group. The page must remain valid for the entire hold, not merely at its
+  anchor phrase. Any mismatch fails the timeline even when the page numbers are
+  sequential.
+- Reject any state for which a reviewer could reasonably ask, "Why is this
+  specific page on screen now?" Sequential order, topical relatedness, visual
+  variety, page-count coverage, and avoiding slide reuse are not evidence of
+  synchronization.
 
 ### 5. Render
 
 **Static:** use `scripts/render_slideshow.py` with FFmpeg, 1920×1080, 30 fps,
 H.264/AAC, ASS subtitles, and the approved semantic slide timeline. Default page
 transition is a 0.7-second crossfade.
+
+For Static production or revision, read
+[references/static-pipeline.md](references/static-pipeline.md). Use its common
+coverage, edit-map, caption and source-binding helpers rather than cloning an
+old episode pipeline. An old subtitle/cache/WPS report requires exact source
+identity; current filenames and page counts alone do not justify reuse.
 
 **Dynamic:** follow [references/dynamic-video.md](references/dynamic-video.md).
 HyperFrames consumes the portable resolved motion plan and semantic SVG groups;
@@ -166,6 +221,10 @@ used only through seek-safe HyperFrames guidance.
 - Confirm the opening contains only the chosen content sentence, subtitles are
   complete and safe, visuals match concurrent speech, and no unwanted outro
   remains.
+- Record actual QA methods separately. ASR, decode and waveform/correlation
+  checks are not listening review. If required listening cannot be performed,
+  mark it unperformed and disclose that limitation instead of claiming all QA
+  gates passed.
 - Run the semantic checkpoint audit across the full video, not only user-reported
   timestamps or the first pages. Explicitly catch systematic one-page offsets,
   pages shown before their subject is introduced, and pages held after the

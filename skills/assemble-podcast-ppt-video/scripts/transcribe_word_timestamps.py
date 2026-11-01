@@ -5,6 +5,7 @@ import json
 import math
 import os
 from pathlib import Path
+from pipeline_common import coverage_health, file_record, validate_intervals, verify_records
 
 
 def main() -> int:
@@ -16,6 +17,9 @@ def main() -> int:
     parser.add_argument("--language", default="zh")
     parser.add_argument("--window", type=float, default=30.0)
     parser.add_argument("--overlap", type=float, default=2.0)
+    parser.add_argument('--repair-ranges', help='JSON source-time intervals to re-transcribe')
+    parser.add_argument('--existing-transcript', help='Same-audio transcript to merge repairs into')
+    parser.add_argument('--non-speech-ranges', help='Reviewed exclusions with start/end/reason/evidence')
     parser.add_argument(
         "--cpu-threads",
         type=int,
@@ -25,6 +29,19 @@ def main() -> int:
     args = parser.parse_args()
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be at least 1")
+    if args.window < 1 or not args.window.is_integer() or args.overlap < 0 or not math.isfinite(args.duration) or args.duration <= 0:
+        parser.error('Use positive duration/integer window and nonnegative overlap')
+    if bool(args.repair_ranges) != bool(args.existing_transcript):
+        parser.error('Repair ranges and existing transcript must be supplied together')
+    output=Path(args.output)
+    if output.exists():
+        raise ValueError('Transcript output exists; preserve it and use a new version')
+    source_record=file_record(args.audio)
+    existing=None
+    if args.existing_transcript:
+        existing=json.loads(Path(args.existing_transcript).read_text(encoding='utf-8-sig'))
+        if existing.get('source_audio',{}).get('sha256')!=source_record['sha256']:
+            raise ValueError('Repair transcript is not bound to this audio; verify legacy cache identity first')
 
     thread_limit = str(args.cpu_threads)
     os.environ["OMP_NUM_THREADS"] = thread_limit
@@ -45,10 +62,18 @@ def main() -> int:
     info = None
     sample_rate = 16000
     decoded_audio = decode_audio(args.audio, sampling_rate=sample_rate)
-    for start in range(0, math.ceil(args.duration), int(args.window)):
-        next_start = min(args.duration, start + args.window)
-        clip_start = max(0.0, start - args.overlap)
-        clip_end = min(args.duration, next_start + args.overlap)
+    if abs(len(decoded_audio)/sample_rate-args.duration)>.15:
+        raise ValueError('Supplied duration differs from decoded audio')
+    if args.repair_ranges:
+        windows=json.loads(Path(args.repair_ranges).read_text(encoding='utf-8-sig'))
+        validate_intervals(windows,args.duration)
+    else:
+        windows=[(start,min(args.duration,start+args.window)) for start in range(0,math.ceil(args.duration),int(args.window))]
+    for start,next_start in windows:
+        # Repairs intentionally exclude the preceding greeting/music rather than
+        # reintroducing the failed context through overlap.
+        clip_start = start if args.repair_ranges else max(0.0,start-args.overlap)
+        clip_end = next_start if args.repair_ranges else min(args.duration,next_start+args.overlap)
         if clip_start >= clip_end:
             continue
         clip_audio = decoded_audio[int(clip_start * sample_rate) : int(clip_end * sample_rate)]
@@ -101,17 +126,32 @@ def main() -> int:
 
     if info is None:
         raise RuntimeError("No audio segments were processed")
-    output = Path(args.output)
+    if args.existing_transcript:
+        kept=[]
+        for s in existing['segments']:
+            words=[w for w in s.get('words',[]) if not any(w['end']>a and w['start']<b for a,b in windows)]
+            if words:
+                kept.append({'start':words[0]['start'],'end':words[-1]['end'],'text':''.join(w['word'] for w in words),'words':words})
+        rows=sorted(kept+rows,key=lambda s:s['start'])
+    output.parent.mkdir(parents=True,exist_ok=True)
+    verify_records([source_record])
     output.write_text(
         json.dumps(
-            {"language": info.language, "duration": round(args.duration, 3), "segments": rows},
+            {"language": info.language, "duration": round(args.duration, 3), "segments": rows, 'source_audio':source_record},
             ensure_ascii=False,
             indent=2,
         ),
         encoding="utf-8",
     )
     print(json.dumps({"duration": round(args.duration, 3), "segments": len(rows), "output": str(output)}))
-    return 0
+    ignored=json.loads(Path(args.non_speech_ranges).read_text(encoding='utf-8-sig')) if args.non_speech_ranges else []
+    health=coverage_health(decoded_audio,sample_rate,rows,ignored_ranges=ignored)
+    health['sources']=[source_record,file_record(output)]
+    if args.non_speech_ranges:
+        health['sources'].append(file_record(args.non_speech_ranges))
+    output.with_name(output.stem+'_coverage.json').write_text(json.dumps(health,ensure_ascii=False,indent=2),encoding='utf-8')
+    print(json.dumps({'coverage_passed':health['passed'],'uncovered_active_ranges':health['uncovered_active_ranges']}))
+    return 0 if health['passed'] else 2
 
 
 if __name__ == "__main__":

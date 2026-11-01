@@ -6,6 +6,14 @@ import re
 from bisect import bisect_left
 from difflib import SequenceMatcher
 from pathlib import Path
+from pipeline_common import alignment_health, bound_to, file_record, validate_slide_timing, verify_records
+
+
+def simplified(text: str) -> str:
+    from opencc import OpenCC
+    if not hasattr(simplified, 'converter'):
+        simplified.converter = OpenCC('t2s')
+    return simplified.converter.convert(text)
 
 
 TRADITIONAL = str.maketrans({"這": "这", "給": "给", "選": "选", "個": "个", "們": "们", "為": "为", "與": "与", "說": "说", "對": "对", "長": "长"})
@@ -17,7 +25,7 @@ PROTECTED_PAIRS = {
 
 
 def normalized(text: str) -> str:
-    return "".join(re.findall(r"[\u4e00-\u9fff0-9a-z]", text.translate(TRADITIONAL).lower()))
+    return "".join(re.findall(r"[\u4e00-\u9fff0-9a-z]", simplified(text).lower()))
 
 
 def ass_time(seconds: float) -> str:
@@ -37,7 +45,7 @@ def srt_time(seconds: float) -> str:
 
 
 def script_body(path: Path) -> str:
-    source = path.read_text(encoding="utf-8")
+    source = path.read_text(encoding="utf-8-sig")
     parts = re.split(r"(?m)^---\s*$", source)
     source = parts[2] if len(parts) >= 3 else source
     lines = []
@@ -45,31 +53,52 @@ def script_body(path: Path) -> str:
         line = line.strip()
         if not line or line.startswith(">") or line.startswith("#"):
             continue
-        line = re.sub(r"^(?:说话人\d+|speaker\s*\d+)[：:]", "", line, flags=re.IGNORECASE)
+        line = re.sub(r"^(?:说话人\d+|speaker\s*\d+|大壹|咪仔)[：:]\s*", "", line, flags=re.IGNORECASE)
         lines.append(line)
-    return "".join(lines)
+    return simplified("".join(lines))
 
 
 def split_captions(text: str, max_chars: int = 20) -> list[str]:
-    result: list[str] = []
-    for sentence in [part for part in re.split(r"(?<=[。！？])", text) if part]:
-        sentence = re.sub(r"\s+", "", sentence)
-        while len(sentence) > max_chars:
-            cut = max(sentence.rfind(mark, 0, max_chars + 1) for mark in "，、；：——")
-            cut = cut + 1 if cut >= max_chars // 3 else max_chars
-            # Keep trailing punctuation or a tiny phrase with the preceding caption.
-            if len(sentence) - cut <= 3:
-                cut = len(sentence)
-            result.append(sentence[:cut])
-            sentence = sentence[cut:]
-        if sentence:
-            result.append(sentence)
-    for index in range(len(result) - 1):
-        left, right = result[index], result[index + 1]
-        if left and right and left[-1] + right[0] in PROTECTED_PAIRS:
-            result[index] = left[:-1]
-            result[index + 1] = left[-1] + right
-    return [part for part in result if part]
+    import jieba
+    if max_chars < 4:
+        raise ValueError('Caption width must allow complete words')
+    text=re.sub(r'\s+','',simplified(text))
+    jieba.add_word('关键信息')
+    boundaries=set()
+    offset=0
+    for word in jieba.cut(text):
+        offset+=len(word)
+        boundaries.add(offset)
+    result=[]
+    offset=0
+    while text:
+        if len(text)<=max_chars:
+            cut=len(text)
+        else:
+            sentence=re.search(r'[。！？；][”’」』]?',text[:max_chars+1])
+            soft=[m.end() for m in re.finditer(r'[，、：]',text[:max_chars+1]) if m.end()>=max_chars//3]
+            if sentence:
+                cut=sentence.end()
+            elif soft:
+                cut=soft[-1]
+            else:
+                candidates=[b-offset for b in boundaries if offset<b<=offset+max_chars]
+                cut=max(candidates) if candidates else min(b-offset for b in boundaries if b>offset)
+        while cut<len(text) and text[cut] in '，。！？；：、”’」』':
+            cut+=1
+        result.append(text[:cut])
+        text=text[cut:]
+        offset+=cut
+    return result
+
+
+def reviewed_captions(text, rows):
+    rows=[simplified(x.strip()) for x in rows if x.strip()]
+    if normalized(''.join(rows))!=normalized(text):
+        raise ValueError('Reviewed caption lines must preserve the canonical script')
+    if any(row[0] in '，。！？；：、' for row in rows):
+        raise ValueError('A caption cannot start with trailing punctuation')
+    return rows
 
 
 def main() -> int:
@@ -81,11 +110,27 @@ def main() -> int:
     parser.add_argument("--trim-offset", type=float, required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--base", required=True)
+    parser.add_argument('--caption-lines', help='Reviewed UTF-8 captions, one line per cue; punctuation-only edits')
+    parser.add_argument('--max-chars', type=int, default=25)
+    parser.add_argument('--max-unmatched-run', type=int, default=20)
+    parser.add_argument('--min-coverage', type=float, default=.9)
+    parser.add_argument('--coverage-report', help='Passed source-bound transcript coverage report')
+    parser.add_argument('--font-size', type=int, default=48)
+    parser.add_argument('--margin-bottom', type=int, default=6)
     args = parser.parse_args()
 
     body = script_body(Path(args.script))
-    captions = split_captions(body)
+    captions = reviewed_captions(body,Path(args.caption_lines).read_text(encoding='utf-8-sig').splitlines()) if args.caption_lines else split_captions(body,args.max_chars)
     transcript = json.loads(Path(args.transcript).read_text(encoding="utf-8"))
+    if transcript.get('time_basis')=='edited' and args.trim_offset!=0:
+        raise ValueError('Edited timestamps must use --trim-offset 0')
+    if args.coverage_report:
+        coverage=json.loads(Path(args.coverage_report).read_text(encoding='utf-8'))
+        if not coverage['passed']:
+            raise ValueError('Transcript coverage has unresolved active-audio gaps')
+        verify_records(coverage['sources'])
+        if not bound_to(args.transcript,coverage['sources']):
+            raise ValueError('Coverage report is for a different transcript')
     asr_chars, asr_times = [], []
     for segment in transcript["segments"]:
         for word in segment.get("words", []):
@@ -111,6 +156,19 @@ def main() -> int:
     positions = sorted(matches)
     if not positions:
         raise RuntimeError("The podcast script could not be aligned to the audio")
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    check_path=output/'alignment_check.json'
+    health=alignment_health(len(canonical),matches,args.max_unmatched_run,args.min_coverage)
+    sources=[file_record(p) for p in (args.script,args.transcript,args.anchors)]
+    if args.caption_lines:
+        sources.append(file_record(args.caption_lines))
+    if args.coverage_report:
+        sources.append(file_record(args.coverage_report))
+        sources.extend(coverage['sources'])
+    check_path.write_text(json.dumps(dict(health,sources=sources,outputs=[]),ensure_ascii=False,indent=2),encoding='utf-8')
+    if not health['passed']:
+        raise ValueError('Local/global alignment failed; inspect alignment_check.json and re-transcribe missing regions')
 
     def raw_time(position: int, end: bool = False) -> float:
         if position in matches:
@@ -137,7 +195,9 @@ def main() -> int:
     for index in range(len(subtitle_rows) - 1):
         subtitle_rows[index]["end"] = round(min(subtitle_rows[index]["end"], subtitle_rows[index + 1]["start"]), 3)
         if subtitle_rows[index]["end"] <= subtitle_rows[index]["start"]:
-            subtitle_rows[index]["end"] = round(subtitle_rows[index]["start"] + 0.15, 3)
+            raise ValueError('Caption timing collapsed or overlaps; repair alignment rather than extend through the next cue')
+    if any(row['end']<=row['start'] or row['end']>args.duration+.001 for row in subtitle_rows):
+        raise ValueError('Caption timing is outside edited audio')
 
     anchors = json.loads(Path(args.anchors).read_text(encoding="utf-8"))
     if len(anchors) == 0:
@@ -152,15 +212,14 @@ def main() -> int:
         search_from = position + 1
     starts = [video_time(position) for position in anchor_positions]
     starts[0] = 0.0
-    for index in range(1, len(starts)):
-        minimum = 6.0 if index == 1 else 4.5
-        starts[index] = max(starts[index], starts[index - 1] + minimum)
+    validate_slide_timing(starts,args.duration)
     if starts[-1] >= args.duration:
         raise RuntimeError("Slide timeline exceeds the edited audio duration")
     slides = []
     for index, (anchor, start) in enumerate(zip(anchors, starts), 1):
         end = starts[index] if index < len(starts) else args.duration
-        slides.append({"slide": index, "file": f"slide-{index:02d}.png", "start": round(start, 3), "end": round(end, 3), "duration": round(end - start, 3), "anchor": anchor["anchor"]})
+        slide_number = int(anchor.get("slide", index))
+        slides.append({"slide": slide_number, "file": f"slide-{slide_number:02d}.png", "start": round(start, 3), "end": round(end, 3), "duration": round(end - start, 3), "anchor": anchor["anchor"]})
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -173,12 +232,15 @@ def main() -> int:
             handle.write(f"{number}\n{srt_time(row['start'])} --> {srt_time(row['end'])}\n{row['text']}\n\n")
     header = """[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\nWrapStyle: 2\nScaledBorderAndShadow: yes\n\n[V4+ Styles]\nFormat: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding\nStyle: Subtitle,Noto Sans SC,76,&H00FFFFFF,&H000000FF,&H00141414,&H96000000,1,0,0,0,100,100,0,0,1,3.2,0.8,2,80,80,70,1\n\n[Events]\nFormat: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text\n"""
     with ass.open("w", encoding="utf-8") as handle:
+        header=header.replace('Noto Sans SC,76,',f'Noto Sans SC,{args.font_size},').replace(',2,80,80,70,1',f',2,80,80,{args.margin_bottom},1')
         handle.write(header)
         for row in subtitle_rows:
             text = row["text"].replace("\\", "\\\\").replace("{", "").replace("}", "")
             handle.write(f"Dialogue: 0,{ass_time(row['start'])},{ass_time(row['end'])},Subtitle,,0,0,0,,{text}\n")
     timeline.write_text(json.dumps(slides, ensure_ascii=False, indent=2), encoding="utf-8")
     audit.write_text(json.dumps({"duration": args.duration, "subtitle_match_coverage": round(len(matches) / max(1, len(canonical)), 4), "subtitles": subtitle_rows, "slides": slides}, ensure_ascii=False, indent=2), encoding="utf-8")
+    health.update(sources=sources,outputs=[file_record(p) for p in (srt,ass,timeline,audit)])
+    check_path.write_text(json.dumps(health,ensure_ascii=False,indent=2),encoding='utf-8')
     print(json.dumps({"captions": len(subtitle_rows), "slides": len(slides), "coverage": round(len(matches) / max(1, len(canonical)), 4)}))
     return 0
 
